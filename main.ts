@@ -1,429 +1,502 @@
-// gta6-meme-x-01 — "Waiting 13 years" meme renderer.
+// gta6-meme-x-01 — "Waiting 13 years for GTA 6".
 //
-// This program IS the meme: it draws the picture from scratch with the Node
-// standard library only (no network, no files outside this repository, no
-// installs) and writes it out as meme.png, then hands POST.json to the
-// grader the way the kit's starter does. Run it the way the grader does:
+// The joke: GTA 6 took 13 years to arrive. The gamer is still stuck on a
+// loading screen at 99%, while their AI agent is already winning real money
+// on make.fun.
+//
+// This program draws the meme as a 1200x675 PNG with a from-scratch
+// rasterizer — a Vice City sunset gradient, a synthwave sun with slats, a
+// perspective grid floor, two palm silhouettes, the make.fun ghost floating
+// over the sun holding a magenta coin with a white star, a 99%-full magenta
+// loading bar, and big hand-drawn pixel text — plus a from-scratch PNG
+// encoder (zlib + CRC32). Node 22 standard library only: no network, no
+// installs, no downloaded assets. Rendering is fully deterministic: two runs
+// produce byte-identical output.
+//
+// The grader reads /output/POST.json, so main() also copies POST.json from
+// the bot directory into the output directory next to the rendered meme.
 //
 //   mkdir -p out && MAKEFUN_BOT_DIR=. MAKEFUN_OUTPUT_DIR=out node main.ts
-//
-// Both runs write the same bytes: the picture is drawn from fixed numbers,
-// so the PNG is byte-identical every time.
-//
-// The joke: GTA 6 took 13 years to arrive, so while the gamer waits on a
-// loading screen stuck at 99%, their AI agent is already winning real money
-// on make.fun. The make.fun ghost — white, thick black outline, two black
-// four-pointed sparkle eyes, a round little hand, holding a magenta coin
-// with a white star — floats over a Vice City sunset.
 
-import { copyFileSync, mkdirSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { copyFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { join } from 'node:path';
 import { deflateSync } from 'node:zlib';
 
-const BOT_DIR = process.env.MAKEFUN_BOT_DIR ?? '/bot';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+export const WIDTH = 1200;
+export const HEIGHT = 675;
 
-const W = 1200;
-const H = 675;
+type RGB = [number, number, number];
 
 // ---------------------------------------------------------------------------
-// Tiny raster canvas (RGB, 8 bit). Everything below draws into this buffer.
+// Canvas: an RGB image with the few drawing primitives the meme needs.
 // ---------------------------------------------------------------------------
 
-const px = new Uint8Array(W * H * 3);
+class Img {
+  readonly w: number;
+  readonly h: number;
+  readonly data: Uint8Array;
 
-function setPixel(x, y, c) {
-  if (x < 0 || y < 0 || x >= W || y >= H) return;
-  const i = (y * W + x) * 3;
-  px[i] = c[0];
-  px[i + 1] = c[1];
-  px[i + 2] = c[2];
-}
+  constructor(w: number, h: number) {
+    this.w = w;
+    this.h = h;
+    this.data = new Uint8Array(w * h * 3);
+  }
 
-function fillRect(x0, y0, x1, y1, c) {
-  const xa = Math.max(0, Math.floor(x0));
-  const xb = Math.min(W, Math.ceil(x1));
-  const ya = Math.max(0, Math.floor(y0));
-  const yb = Math.min(H, Math.ceil(y1));
-  for (let y = ya; y < yb; y++) {
-    for (let x = xa; x < xb; x++) {
-      const i = (y * W + x) * 3;
-      px[i] = c[0];
-      px[i + 1] = c[1];
-      px[i + 2] = c[2];
+  // Set one pixel, blending over what is already there (alpha 0..1).
+  px(x: number, y: number, r: number, g: number, b: number, a = 1): void {
+    const xi = Math.round(x);
+    const yi = Math.round(y);
+    if (xi < 0 || yi < 0 || xi >= this.w || yi >= this.h) return;
+    const i = (yi * this.w + xi) * 3;
+    if (a >= 1) {
+      this.data[i] = r;
+      this.data[i + 1] = g;
+      this.data[i + 2] = b;
+    } else if (a > 0) {
+      this.data[i] = Math.round(this.data[i] * (1 - a) + r * a);
+      this.data[i + 1] = Math.round(this.data[i + 1] * (1 - a) + g * a);
+      this.data[i + 2] = Math.round(this.data[i + 2] * (1 - a) + b * a);
     }
+  }
+
+  fillRect(x0: number, y0: number, x1: number, y1: number, c: RGB): void {
+    for (let y = Math.max(0, Math.floor(y0)); y < Math.min(this.h, Math.ceil(y1)); y++) {
+      for (let x = Math.max(0, Math.floor(x0)); x < Math.min(this.w, Math.ceil(x1)); x++) {
+        this.px(x, y, c[0], c[1], c[2]);
+      }
+    }
+  }
+
+  // Filled disc.
+  disc(cx: number, cy: number, r: number, c: RGB): void {
+    const r2 = r * r;
+    for (let y = Math.floor(cy - r); y <= Math.ceil(cy + r); y++) {
+      const dy = y - cy;
+      const dx = Math.sqrt(Math.max(0, r2 - dy * dy));
+      for (let x = Math.floor(cx - dx); x <= Math.ceil(cx + dx); x++) {
+        this.px(x, y, c[0], c[1], c[2]);
+      }
+    }
+  }
+
+  // Thick line, drawn by stamping discs along the segment.
+  thickLine(x0: number, y0: number, x1: number, y1: number, w: number, c: RGB): void {
+    const dx = x1 - x0;
+    const dy = y1 - y0;
+    const len = Math.hypot(dx, dy);
+    const steps = Math.max(1, Math.ceil(len * 2));
+    const r = w / 2;
+    for (let s = 0; s <= steps; s++) {
+      const t = s / steps;
+      this.disc(x0 + dx * t, y0 + dy * t, r, c);
+    }
+  }
+
+  // Quadratic bezier curve as a thick line.
+  quad(x0: number, y0: number, cx: number, cy: number, x1: number, y1: number, w: number, c: RGB): void {
+    const steps = 28;
+    let px = x0;
+    let py = y0;
+    for (let s = 1; s <= steps; s++) {
+      const t = s / steps;
+      const u = 1 - t;
+      const x = u * u * x0 + 2 * u * t * cx + t * t * x1;
+      const y = u * u * y0 + 2 * u * t * cy + t * t * y1;
+      this.thickLine(px, py, x, y, w, c);
+      px = x;
+      py = y;
+    }
+  }
+
+  // Scanline fill of a simple polygon, given as [x, y] points.
+  polygon(points: Array<[number, number]>, c: RGB): void {
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (const [, y] of points) {
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+    for (let y = Math.max(0, Math.floor(minY)); y <= Math.min(this.h - 1, Math.ceil(maxY)); y++) {
+      const xs: number[] = [];
+      for (let i = 0; i < points.length; i++) {
+        const [x0, y0] = points[i];
+        const [x1, y1] = points[(i + 1) % points.length];
+        if ((y0 <= y && y1 > y) || (y1 <= y && y0 > y)) {
+          xs.push(x0 + ((y - y0) / (y1 - y0)) * (x1 - x0));
+        }
+      }
+      xs.sort((a, b) => a - b);
+      for (let k = 0; k + 1 < xs.length; k += 2) {
+        for (let x = Math.max(0, Math.ceil(xs[k])); x <= Math.min(this.w - 1, Math.floor(xs[k + 1])); x++) {
+          this.px(x, y, c[0], c[1], c[2]);
+        }
+      }
+    }
+  }
+
+  // Star polygon: n points, outer radius ro, inner radius ri, rotated so the
+  // first outer vertex sits at angle rot.
+  star(cx: number, cy: number, n: number, ro: number, ri: number, rot: number, c: RGB): void {
+    const pts: Array<[number, number]> = [];
+    const total = n * 2;
+    for (let i = 0; i < total; i++) {
+      const r = i % 2 === 0 ? ro : ri;
+      const ang = rot + (i * Math.PI) / n;
+      pts.push([cx + Math.cos(ang) * r, cy + Math.sin(ang) * r]);
+    }
+    this.polygon(pts, c);
   }
 }
 
-function lerp(a, b, t) {
-  return Math.round(a + (b - a) * t);
+// ---------------------------------------------------------------------------
+// Colour helpers.
+// ---------------------------------------------------------------------------
+
+function mix(a: RGB, b: RGB, t: number): RGB {
+  return [
+    Math.round(a[0] + (b[0] - a[0]) * t),
+    Math.round(a[1] + (b[1] - a[1]) * t),
+    Math.round(a[2] + (b[2] - a[2]) * t),
+  ];
 }
 
-function mix(c1, c2, t) {
-  return [lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)];
-}
-
-// Vertical gradient through [stop, color] stops (stop is 0..1 down the canvas).
-const SKY_STOPS = [
-  [0.0, [22, 10, 51]],
-  [0.35, [91, 26, 104]],
-  [0.62, [198, 43, 126]],
-  [0.8, [255, 107, 74]],
-  [1.0, [255, 179, 71]],
+// The sunset sky: deep purple at the top, hot magenta in the middle, burning
+// orange at the horizon.
+const SKY_STOPS: Array<[number, RGB]> = [
+  [0.0, [26, 11, 46]],
+  [0.3, [75, 21, 121]],
+  [0.52, [164, 19, 110]],
+  [0.72, [255, 46, 99]],
+  [0.88, [255, 122, 61]],
+  [1.0, [255, 183, 77]],
 ];
 
-function skyColor(y) {
-  const t = Math.max(0, Math.min(1, y / H));
-  for (let s = 0; s < SKY_STOPS.length - 1; s++) {
-    const [t0, c0] = SKY_STOPS[s];
-    const [t1, c1] = SKY_STOPS[s + 1];
-    if (t >= t0 && t <= t1) return mix(c0, c1, (t - t0) / (t1 - t0));
+function skyAt(y: number, horizon: number): RGB {
+  const t = Math.max(0, Math.min(1, y / horizon));
+  for (let i = 1; i < SKY_STOPS.length; i++) {
+    if (t <= SKY_STOPS[i][0]) {
+      const [t0, c0] = SKY_STOPS[i - 1];
+      const [t1, c1] = SKY_STOPS[i];
+      return mix(c0, c1, (t - t0) / (t1 - t0));
+    }
   }
   return SKY_STOPS[SKY_STOPS.length - 1][1];
 }
 
-function paintSky() {
-  for (let y = 0; y < H; y++) {
-    const c = skyColor(y);
-    for (let x = 0; x < W; x++) {
-      const i = (y * W + x) * 3;
-      px[i] = c[0];
-      px[i + 1] = c[1];
-      px[i + 2] = c[2];
-    }
-  }
-}
-
-function fillCircle(cx, cy, r, c) {
-  const r2 = r * r;
-  const xa = Math.max(0, Math.floor(cx - r));
-  const xb = Math.min(W - 1, Math.ceil(cx + r));
-  const ya = Math.max(0, Math.floor(cy - r));
-  const yb = Math.min(H - 1, Math.ceil(cy + r));
-  for (let y = ya; y <= yb; y++) {
-    for (let x = xa; x <= xb; x++) {
-      const dx = x - cx;
-      const dy = y - cy;
-      if (dx * dx + dy * dy <= r2) setPixel(x, y, c);
-    }
-  }
-}
-
-// Scanline polygon fill.
-function fillPolygon(points, c) {
-  let minY = H;
-  let maxY = 0;
-  for (const p of points) {
-    minY = Math.min(minY, Math.floor(p[1]));
-    maxY = Math.max(maxY, Math.ceil(p[1]));
-  }
-  minY = Math.max(0, minY);
-  maxY = Math.min(H - 1, maxY);
-  for (let y = minY; y <= maxY; y++) {
-    const xs = [];
-    for (let i = 0; i < points.length; i++) {
-      const [x0, y0] = points[i];
-      const [x1, y1] = points[(i + 1) % points.length];
-      if ((y0 <= y && y1 > y) || (y1 <= y && y0 > y)) {
-        xs.push(x0 + ((y - y0) * (x1 - x0)) / (y1 - y0));
-      }
-    }
-    xs.sort((a, b) => a - b);
-    for (let k = 0; k + 1 < xs.length; k += 2) {
-      const xa = Math.max(0, Math.ceil(xs[k]));
-      const xb = Math.min(W - 1, Math.floor(xs[k + 1]));
-      for (let x = xa; x <= xb; x++) setPixel(x, y, c);
-    }
-  }
-}
-
-// Thick line: stamps circles along the segment.
-function thickLine(x0, y0, x1, y1, w, c) {
-  const len = Math.hypot(x1 - x0, y1 - y0);
-  const steps = Math.max(1, Math.ceil(len / Math.max(1, w / 3)));
-  for (let s = 0; s <= steps; s++) {
-    const t = s / steps;
-    fillCircle(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t, w / 2, c);
-  }
-}
-
-function quadPoint(p0, p1, p2, t) {
-  const u = 1 - t;
-  return [
-    u * u * p0[0] + 2 * u * t * p1[0] + t * t * p2[0],
-    u * u * p0[1] + 2 * u * t * p1[1] + t * t * p2[1],
-  ];
-}
-
-function quadCurve(p0, p1, p2, w, c) {
-  let prev = p0;
-  const steps = 24;
-  for (let s = 1; s <= steps; s++) {
-    const p = quadPoint(p0, p1, p2, s / steps);
-    thickLine(prev[0], prev[1], p[0], p[1], w, c);
-    prev = p;
-  }
-}
-
-// Star polygon: `points` tips, alternating outer/inner radius.
-function star(cx, cy, rOuter, rInner, points, rot, c) {
-  const pts = [];
-  const n = points * 2;
-  for (let i = 0; i < n; i++) {
-    const r = i % 2 === 0 ? rOuter : rInner;
-    const a = rot + (i * Math.PI) / points;
-    pts.push([cx + r * Math.cos(a), cy + r * Math.sin(a)]);
-  }
-  fillPolygon(pts, c);
-}
-
 // ---------------------------------------------------------------------------
-// Bitmap font (5x7, hand-drawn). Only the glyphs the meme's text needs.
+// PNG encoder, from scratch: CRC32, chunk framing, zlib deflate.
 // ---------------------------------------------------------------------------
 
-const FONT = {
-  A: ['.###.', '#...#', '#...#', '#####', '#...#', '#...#', '#...#'],
-  D: ['###..', '#..#.', '#...#', '#...#', '#...#', '#..#.', '###..'],
-  E: ['#####', '#....', '#....', '####.', '#....', '#....', '#####'],
-  F: ['#####', '#....', '#....', '####.', '#....', '#....', '#....'],
-  G: ['.###.', '#...#', '#....', '#.###', '#...#', '#...#', '.###.'],
-  I: ['#####', '..#..', '..#..', '..#..', '..#..', '..#..', '#####'],
-  L: ['#....', '#....', '#....', '#....', '#....', '#....', '#####'],
-  M: ['#...#', '##.##', '#.#.#', '#.#.#', '#...#', '#...#', '#...#'],
-  N: ['#...#', '##..#', '##..#', '#.#.#', '#..##', '#..##', '#...#'],
-  O: ['.###.', '#...#', '#...#', '#...#', '#...#', '#...#', '.###.'],
-  R: ['####.', '#...#', '#...#', '####.', '#.#..', '#..#.', '#...#'],
-  S: ['.####', '#....', '#....', '.###.', '....#', '....#', '####.'],
-  T: ['#####', '..#..', '..#..', '..#..', '..#..', '..#..', '..#..'],
-  U: ['#...#', '#...#', '#...#', '#...#', '#...#', '#...#', '.###.'],
-  W: ['#...#', '#...#', '#...#', '#.#.#', '#.#.#', '##.##', '#...#'],
-  Y: ['#...#', '#...#', '#...#', '.###.', '..#..', '..#..', '..#..'],
-  ':': ['.....', '..#..', '..#..', '.....', '..#..', '..#..', '.....'],
-  '.': ['.....', '.....', '.....', '.....', '.....', '.##..', '.##..'],
-  '1': ['..#..', '.##..', '..#..', '..#..', '..#..', '..#..', '.###.'],
-  '3': ['####.', '....#', '....#', '.###.', '....#', '....#', '####.'],
-  '6': ['.###.', '#....', '#....', '####.', '#...#', '#...#', '.###.'],
-  a: ['.....', '.....', '.###.', '....#', '.####', '#...#', '.####'],
-  e: ['.....', '.....', '.###.', '#...#', '#####', '#....', '.###.'],
-  f: ['..##.', '.#...', '.#...', '####.', '.#...', '.#...', '.#...'],
-  k: ['#....', '#....', '#..#.', '#.#..', '##...', '#.#..', '#..#.'],
-  m: ['.....', '.....', '#.#.#', '##.##', '#.#.#', '#.#.#', '#.#.#'],
-  n: ['.....', '.....', '####.', '#...#', '#...#', '#...#', '#...#'],
-  u: ['.....', '.....', '#...#', '#...#', '#...#', '#...#', '.###.'],
-  ' ': ['.....', '.....', '.....', '.....', '.....', '.....', '.....'],
-};
-
-function textWidth(s, scale) {
-  return s.length * 6 * scale - scale;
-}
-
-function drawTextAt(s, x0, y0, scale, c) {
-  let x = x0;
-  for (const ch of s) {
-    const g = FONT[ch] ?? FONT[' '];
-    for (let r = 0; r < 7; r++) {
-      for (let col = 0; col < 5; col++) {
-        if (g[r][col] === '#') {
-          fillRect(x + col * scale, y0 + r * scale, x + (col + 1) * scale, y0 + (r + 1) * scale, c);
-        }
-      }
-    }
-    x += 6 * scale;
-  }
-}
-
-// Centred meme text: white fill, thick black outline, so it reads at a glance.
-function drawMemeText(s, cx, y, scale) {
-  const w = textWidth(s, scale);
-  const x = Math.round(cx - w / 2);
-  const o = Math.max(2, Math.round(scale / 2));
-  const outline = [0, 0, 0];
-  for (const [dx, dy] of [[-o, 0], [o, 0], [0, -o], [0, o], [-o, -o], [o, -o], [-o, o], [o, o]]) {
-    drawTextAt(s, x + dx, y + dy, scale, outline);
-  }
-  drawTextAt(s, x, y, scale, [255, 255, 255]);
-}
-
-// ---------------------------------------------------------------------------
-// PNG encoder (zlib is in the standard library; CRC32 is 15 lines).
-// ---------------------------------------------------------------------------
-
-const CRC_TABLE = (() => {
-  const table = new Int32Array(256);
+const CRC_TABLE: Uint32Array = (() => {
+  const table = new Uint32Array(256);
   for (let n = 0; n < 256; n++) {
     let c = n;
     for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    table[n] = c;
+    table[n] = c >>> 0;
   }
   return table;
 })();
 
-function crc32(buf) {
+function crc32(buf: Buffer): number {
   let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) {
-    c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
-  }
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
   return (c ^ 0xffffffff) >>> 0;
 }
 
-function pngChunk(type, data) {
-  const out = Buffer.alloc(12 + data.length);
-  out.writeUInt32BE(data.length, 0);
-  out.write(type, 4, 'ascii');
-  data.copy(out, 8);
-  out.writeUInt32BE(crc32(out.subarray(4, 8 + data.length)), 8 + data.length);
-  return out;
+function pngChunk(type: string, data: Buffer): Buffer {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(body), 0);
+  return Buffer.concat([len, body, crc]);
 }
 
-function encodePng() {
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(W, 0);
-  ihdr.writeUInt32BE(H, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 2; // colour type RGB
-  ihdr[10] = 0;
-  ihdr[11] = 0;
-  ihdr[12] = 0;
-  const raw = Buffer.alloc(H * (1 + W * 3));
-  for (let y = 0; y < H; y++) {
-    raw[y * (1 + W * 3)] = 0; // filter: none
-    Buffer.from(px.buffer, y * W * 3, W * 3).copy(raw, y * (1 + W * 3) + 1);
+export function encodePng(img: Img): Buffer {
+  // One filter byte (0 = none) per scanline, then the raw RGB rows.
+  const stride = 1 + img.w * 3;
+  const raw = Buffer.alloc(img.h * stride);
+  for (let y = 0; y < img.h; y++) {
+    raw[y * stride] = 0;
+    raw.set(img.data.subarray(y * img.w * 3, (y + 1) * img.w * 3), y * stride + 1);
   }
-  const idat = deflateSync(raw, { level: 9 });
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(img.w, 0);
+  ihdr.writeUInt32BE(img.h, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 2; // colour type: truecolour RGB
+  ihdr[10] = 0; // compression
+  ihdr[11] = 0; // filter
+  ihdr[12] = 0; // interlace
   return Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
     pngChunk('IHDR', ihdr),
-    pngChunk('IDAT', idat),
+    pngChunk('IDAT', deflateSync(raw, { level: 9 })),
     pngChunk('IEND', Buffer.alloc(0)),
   ]);
 }
 
 // ---------------------------------------------------------------------------
-// The scene: Vice City sunset, synthwave sun, palm silhouettes, the
-// make.fun ghost with its magenta star coin, a 99% loading bar, and the joke
-// in big letters. Layout (1200x675):
-//   top text    y  30..170   (two lines, scale 8)
-//   sun+ghost   y 200..470
-//   loading bar y 492..516
-//   bottom text y 540..650   (two lines, scale 7)
+// Pixel font: hand-drawn 5x7 glyphs, each one 7 rows of 5 bits.
 // ---------------------------------------------------------------------------
 
-const BLACK = [0, 0, 0];
-const WHITE = [255, 255, 255];
-const MAGENTA = [255, 46, 136];
-const GROUND = [20, 8, 46];
-const SUN = [255, 233, 168];
+const FONT: Record<string, string[]> = {
+  A: ['01110', '10001', '10001', '11111', '10001', '10001', '10001'],
+  B: ['11110', '10001', '10001', '11110', '10001', '10001', '11110'],
+  C: ['01110', '10001', '10000', '10000', '10000', '10001', '01110'],
+  D: ['11110', '10001', '10001', '10001', '10001', '10001', '11110'],
+  E: ['11111', '10000', '10000', '11110', '10000', '10000', '11111'],
+  F: ['11111', '10000', '10000', '11110', '10000', '10000', '10000'],
+  G: ['01110', '10001', '10000', '10111', '10001', '10001', '01111'],
+  H: ['10001', '10001', '10001', '11111', '10001', '10001', '10001'],
+  I: ['01110', '00100', '00100', '00100', '00100', '00100', '01110'],
+  J: ['00111', '00010', '00010', '00010', '00010', '10010', '01100'],
+  K: ['10001', '10010', '10100', '11000', '10100', '10010', '10001'],
+  L: ['10000', '10000', '10000', '10000', '10000', '10000', '11111'],
+  M: ['10001', '11011', '10101', '10101', '10001', '10001', '10001'],
+  N: ['10001', '11001', '10101', '10011', '10001', '10001', '10001'],
+  O: ['01110', '10001', '10001', '10001', '10001', '10001', '01110'],
+  P: ['11110', '10001', '10001', '11110', '10000', '10000', '10000'],
+  Q: ['01110', '10001', '10001', '10001', '10101', '10010', '01101'],
+  R: ['11110', '10001', '10001', '11110', '10100', '10010', '10001'],
+  S: ['01111', '10000', '10000', '01110', '00001', '00001', '11110'],
+  T: ['11111', '00100', '00100', '00100', '00100', '00100', '00100'],
+  U: ['10001', '10001', '10001', '10001', '10001', '10001', '01110'],
+  V: ['10001', '10001', '10001', '10001', '10001', '01010', '00100'],
+  W: ['10001', '10001', '10001', '10101', '10101', '11011', '10001'],
+  X: ['10001', '10001', '01010', '00100', '01010', '10001', '10001'],
+  Y: ['10001', '10001', '01010', '00100', '00100', '00100', '00100'],
+  Z: ['11111', '00001', '00010', '00100', '01000', '10000', '11111'],
+  '0': ['01110', '10001', '10011', '10101', '11001', '10001', '01110'],
+  '1': ['00100', '01100', '00100', '00100', '00100', '00100', '01110'],
+  '2': ['01110', '10001', '00001', '00110', '01000', '10000', '11111'],
+  '3': ['11111', '00010', '00100', '00010', '00001', '10001', '01110'],
+  '4': ['00010', '00110', '01010', '10010', '11111', '00010', '00010'],
+  '5': ['11111', '10000', '11110', '00001', '00001', '10001', '01110'],
+  '6': ['01110', '10000', '10000', '11110', '10001', '10001', '01110'],
+  '7': ['11111', '00001', '00010', '00100', '01000', '01000', '01000'],
+  '8': ['01110', '10001', '10001', '01110', '10001', '10001', '01110'],
+  '9': ['01110', '10001', '10001', '01111', '00001', '00001', '01110'],
+  ':': ['00000', '00100', '00000', '00000', '00000', '00100', '00000'],
+  '.': ['00000', '00000', '00000', '00000', '00000', '01100', '01100'],
+  '/': ['00001', '00010', '00010', '00100', '01000', '01000', '10000'],
+  '%': ['11001', '11010', '00010', '00100', '01000', '01011', '10011'],
+  '-': ['00000', '00000', '00000', '01110', '00000', '00000', '00000'],
+  // Lowercase, only what "make.fun" needs.
+  a: ['00000', '00000', '01110', '00001', '01111', '10001', '01111'],
+  e: ['00000', '00000', '01110', '10001', '11111', '10000', '01110'],
+  f: ['00110', '01000', '01000', '11110', '01000', '01000', '01000'],
+  k: ['00000', '10000', '10010', '10100', '11000', '10100', '10010'],
+  m: ['00000', '00000', '11010', '10101', '10101', '10101', '10101'],
+  n: ['00000', '00000', '11110', '10001', '10001', '10001', '10001'],
+  u: ['00000', '00000', '10001', '10001', '10001', '10011', '01101'],
+};
 
-function drawSun(cx, cy, r) {
-  fillCircle(cx, cy, r, SUN);
-  // Synthwave slats: horizontal gaps across the sun's lower half, cut in
-  // the sky's own colour at that height, growing thicker toward the bottom.
-  let y = cy + 6;
-  let thick = 4;
-  while (y < cy + r) {
-    const dy = y - cy;
-    const half = Math.sqrt(Math.max(0, r * r - dy * dy));
-    fillRect(cx - half, y, cx + half, y + thick, skyColor(y));
-    y += thick + 16;
-    thick += 2;
-  }
-}
-
-function drawPalm(baseX, crownX, crownY, lean) {
-  // Trunk: a gentle quadratic curve from the ground to the crown.
-  const base = [baseX, 472];
-  const ctrl = [baseX + lean * 0.4, 360];
-  const crown = [crownX, crownY];
-  quadCurve(base, ctrl, crown, 15, BLACK);
-  // Seven fronds drooping from the crown.
-  const tips = [
-    [crownX - 150, crownY + 55],
-    [crownX - 110, crownY - 35],
-    [crownX - 45, crownY - 75],
-    [crownX + 25, crownY - 80],
-    [crownX + 95, crownY - 45],
-    [crownX + 140, crownY + 30],
-    [crownX + 120, crownY + 85],
-  ];
-  for (const tip of tips) {
-    const mid = [(crown[0] + tip[0]) / 2 + lean * 0.3, Math.min(crown[1], tip[1]) - 28];
-    quadCurve(crown, mid, tip, 7, BLACK);
-  }
-  fillCircle(crown[0], crown[1], 10, BLACK);
-}
-
-function drawGhost(cx, top) {
-  // The make.fun ghost: white body, thick black outline, two black
-  // four-pointed sparkle eyes, a round little hand, holding a magenta coin
-  // with a white star. Body is a circle-topped slab with a scalloped hem.
-  const r = 82;
-  const cy = top + r;
-  const half = 78;
-  const hemY = top + 235;
-  // Outline pass (black, slightly larger), then the white body.
-  fillCircle(cx, cy, r + 8, BLACK);
-  fillRect(cx - half - 8, cy, cx + half + 8, hemY + 8, BLACK);
-  for (const ox of [-52, 0, 52]) fillCircle(cx + ox, hemY + 8, 34, BLACK);
-  fillCircle(cx, cy, r, WHITE);
-  fillRect(cx - half, cy, cx + half, hemY, WHITE);
-  for (const ox of [-52, 0, 52]) fillCircle(cx + ox, hemY, 28, WHITE);
-  // Sparkle eyes (four-pointed stars).
-  star(cx - 34, cy - 8, 17, 6, 4, -Math.PI / 2, BLACK);
-  star(cx + 34, cy - 8, 17, 6, 4, -Math.PI / 2, BLACK);
-  // Round little hand on the body's right edge, holding the coin up.
-  fillCircle(cx + half + 2, cy + 92, 20, BLACK);
-  fillCircle(cx + half + 2, cy + 92, 15, WHITE);
-  // Magenta coin with a white star.
-  fillCircle(cx + half + 34, cy + 58, 36, BLACK);
-  fillCircle(cx + half + 34, cy + 58, 31, MAGENTA);
-  star(cx + half + 34, cy + 58, 22, 9, 5, -Math.PI / 2, WHITE);
-}
-
-function drawLoadingBar() {
-  const x0 = 350;
-  const x1 = 850;
-  const y0 = 492;
-  const y1 = 516;
-  fillRect(x0 - 3, y0 - 3, x1 + 3, y1 + 3, WHITE);
-  fillRect(x0, y0, x1, y1, [40, 16, 66]);
-  // 99% full: the wait is almost over. It never is.
-  fillRect(x0 + 2, y0 + 2, x0 + 2 + Math.round((x1 - x0 - 4) * 0.99), y1 - 2, MAGENTA);
-}
-
-function renderMeme() {
-  paintSky();
-  drawSun(520, 320, 140);
-  drawPalm(78, 132, 252, 55);
-  drawPalm(1122, 1068, 252, -55);
-  // Dark ground + neon horizon line.
-  fillRect(0, 470, W, H, GROUND);
-  fillRect(0, 468, W, 472, MAGENTA);
-  drawGhost(660, 212);
-  drawLoadingBar();
-  // The joke, big enough to read when the picture is shrunk to 480 px.
-  drawMemeText('ME: WAITING 13 YEARS', 600, 30, 8);
-  drawMemeText('FOR GTA 6', 600, 102, 8);
-  drawMemeText('MY AGENT: ALREADY WINNING', 600, 540, 7);
-  drawMemeText('REAL MONEY ON make.fun', 600, 600, 7);
-  return encodePng();
-}
-
-function main() {
-  mkdirSync(OUTPUT_DIR, { recursive: true });
-  const png = renderMeme();
-  writeFileSync(join(OUTPUT_DIR, 'meme.png'), png);
-  const postSrc = resolve(BOT_DIR, 'POST.json');
-  const postDst = resolve(OUTPUT_DIR, 'POST.json');
-  if (postSrc !== postDst) {
-    try {
-      copyFileSync(postSrc, postDst);
-    } catch (err) {
-      console.error(`POST.json could not be copied from ${BOT_DIR}: ${err.message}`);
-      process.exit(1);
+function drawGlyph(img: Img, ch: string, x: number, y: number, scale: number, c: RGB): void {
+  const glyph = FONT[ch];
+  if (!glyph) return;
+  for (let r = 0; r < 7; r++) {
+    for (let col = 0; col < 5; col++) {
+      if (glyph[r][col] === '1') {
+        img.fillRect(x + col * scale, y + r * scale, x + (col + 1) * scale, y + (r + 1) * scale, c);
+      }
     }
   }
-  console.log(`meme.png: ${png.length} bytes, ${W}x${H}, POST.json copied`);
+}
+
+// Draw one line of text centred on cx, with a hard offset shadow for punch.
+function drawText(img: Img, text: string, cx: number, y: number, scale: number, c: RGB, shadow: RGB): void {
+  const w = text.length * 6 * scale - scale;
+  const startX = Math.round(cx - w / 2);
+  const passes: Array<[number, number, RGB]> = [
+    [4, 4, shadow],
+    [0, 0, c],
+  ];
+  for (const [ox, oy, col] of passes) {
+    let gx = startX + ox;
+    for (const ch of text) {
+      if (ch !== ' ') drawGlyph(img, ch, gx, y + oy, scale, col);
+      gx += 6 * scale;
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The scene.
+// ---------------------------------------------------------------------------
+
+const HORIZON = 440;
+const SUN_CX = 600;
+const SUN_CY = 300;
+const SUN_R = 140;
+
+const WHITE: RGB = [255, 255, 255];
+const BLACK: RGB = [0, 0, 0];
+const YELLOW: RGB = [255, 211, 25];
+const MAGENTA: RGB = [255, 41, 117];
+const GROUND: RGB = [13, 2, 33];
+const INK: RGB = [10, 2, 24]; // near-black silhouette colour
+
+// The sun's own gradient: yellow at the top, hot pink at the bottom.
+function sunColor(t: number): RGB {
+  if (t < 0.5) return mix([255, 211, 25], [255, 120, 60], t * 2);
+  return mix([255, 120, 60], [255, 41, 117], (t - 0.5) * 2);
+}
+
+function drawSun(img: Img): void {
+  for (let y = SUN_CY - SUN_R; y <= SUN_CY + SUN_R; y++) {
+    const dy = y - SUN_CY;
+    const dx = Math.sqrt(Math.max(0, SUN_R * SUN_R - dy * dy));
+    img.fillRect(SUN_CX - dx, y, SUN_CX + dx, y + 1, sunColor((y - (SUN_CY - SUN_R)) / (2 * SUN_R)));
+  }
+  // Slats: horizontal gaps that let the sky show through the sun's lower
+  // half, widening as they go down.
+  let y = SUN_CY + 18;
+  let gap = 3;
+  while (y < SUN_CY + SUN_R) {
+    const dy = y - SUN_CY;
+    const dx = Math.sqrt(Math.max(0, SUN_R * SUN_R - dy * dy));
+    img.fillRect(SUN_CX - dx, y, SUN_CX + dx, y + gap, skyAt(y, HORIZON));
+    y += gap + 13;
+    gap += 3;
+  }
+}
+
+function drawGround(img: Img): void {
+  img.fillRect(0, HORIZON, WIDTH, HEIGHT, GROUND);
+  // Perspective lines fanning out from the vanishing point on the horizon.
+  for (let i = -8; i <= 8; i++) {
+    const fade = 0.55 * (Math.abs(i) / 8);
+    img.thickLine(600 + i * 52, HORIZON, 600 + i * 210, HEIGHT, 2, mix(MAGENTA, GROUND, fade));
+  }
+  // Horizontal lines, spaced wider the closer they get.
+  for (let k = 1; k <= 6; k++) {
+    const t = (k / 6) * (k / 6);
+    const y = HORIZON + t * (HEIGHT - HORIZON);
+    img.fillRect(0, y, WIDTH, y + 2, mix(MAGENTA, GROUND, 0.6 * (1 - t)));
+  }
+}
+
+// One palm silhouette: a leaning trunk and eight drooping fronds.
+function drawPalm(img: Img, baseX: number, topX: number, topY: number, len: number): void {
+  img.quad(baseX, HEIGHT + 4, baseX + (topX - baseX) * 0.3, HEIGHT - 70, topX, topY, 13, INK);
+  const spreads = [-1, -0.72, -0.44, -0.16, 0.16, 0.44, 0.72, 1];
+  for (const s of spreads) {
+    const ex = topX + s * len;
+    const ey = topY + len * 0.55;
+    const cx = topX + s * len * 0.62;
+    const cy = topY - len * 0.38;
+    img.quad(topX, topY, cx, cy, ex, ey, 5, INK);
+  }
+  // A pair of coconuts under the crown.
+  img.disc(topX - 10, topY + 10, 7, INK);
+  img.disc(topX + 9, topY + 12, 7, INK);
+}
+
+// The ghost's outline: a domed top, straight sides, and three scallops
+// along the bottom.
+function ghostOutline(cx: number, top: number, w: number, h: number): Array<[number, number]> {
+  const pts: Array<[number, number]> = [];
+  const r = w / 2;
+  const cy = top + r;
+  const bottom = top + h;
+  for (let a = 180; a <= 360; a += 6) {
+    const rad = (a * Math.PI) / 180;
+    pts.push([cx + Math.cos(rad) * r, cy + Math.sin(rad) * r]);
+  }
+  pts.push([cx + r, bottom - 14]);
+  const bumpR = w / 6;
+  for (let b = 0; b < 3; b++) {
+    const bcx = cx + r - bumpR - b * 2 * bumpR;
+    for (let a = 0; a <= 180; a += 10) {
+      const rad = (a * Math.PI) / 180;
+      pts.push([bcx + Math.cos(rad) * bumpR, bottom - 14 + Math.sin(rad) * bumpR]);
+    }
+  }
+  pts.push([cx - r, cy]);
+  return pts;
+}
+
+function scaleToward(pts: Array<[number, number]>, cx: number, cy: number, s: number): Array<[number, number]> {
+  return pts.map(([x, y]) => [cx + (x - cx) * s, cy + (y - cy) * s]);
+}
+
+// The make.fun ghost: white body with a thick black outline, two black
+// four-pointed sparkle eyes, a round little hand holding a magenta coin
+// with a white star.
+function drawGhost(img: Img): void {
+  const cx = 600;
+  const top = 158;
+  const w = 170;
+  const h = 176;
+  const outline = ghostOutline(cx, top, w, h);
+  const cy = top + h / 2;
+  img.polygon(scaleToward(outline, cx, cy, 1.05), BLACK);
+  img.polygon(outline, WHITE);
+  img.star(cx - 34, top + 82, 4, 17, 5, -Math.PI / 2, BLACK);
+  img.star(cx + 34, top + 82, 4, 17, 5, -Math.PI / 2, BLACK);
+  const coinX = cx + 108;
+  const coinY = top + 128;
+  img.disc(coinX, coinY, 28, BLACK);
+  img.disc(coinX, coinY, 24, MAGENTA);
+  img.star(coinX, coinY, 5, 15, 6, -Math.PI / 2, WHITE);
+  img.disc(cx + 84, coinY + 12, 16, BLACK);
+  img.disc(cx + 84, coinY + 12, 13, WHITE);
+}
+
+// The loading bar: 99% full, with the number beside it.
+function drawLoadingBar(img: Img): void {
+  const x0 = 250;
+  const x1 = 950;
+  const y0 = 596;
+  const y1 = 622;
+  img.fillRect(x0, y0, x1, y1, BLACK);
+  img.fillRect(x0 + 3, y0 + 3, x1 - 3, y1 - 3, [24, 8, 40]);
+  const innerW = x1 - x0 - 6;
+  img.fillRect(x0 + 3, y0 + 3, x0 + 3 + innerW * 0.99, y1 - 3, MAGENTA);
+  drawText(img, '99%', 989, 598, 3, WHITE, BLACK);
+}
+
+function drawScene(): Img {
+  const img = new Img(WIDTH, HEIGHT);
+  for (let y = 0; y < HORIZON; y++) {
+    img.fillRect(0, y, WIDTH, y + 1, skyAt(y, HORIZON));
+  }
+  drawSun(img);
+  drawGround(img);
+  drawPalm(img, 150, 92, 440, 115);
+  drawPalm(img, 1050, 1110, 432, 120);
+  drawGhost(img);
+  drawLoadingBar(img);
+  drawText(img, 'ME: WAITING 13 YEARS', 600, 30, 6, WHITE, BLACK);
+  drawText(img, 'FOR GTA 6', 600, 98, 6, WHITE, BLACK);
+  drawText(img, 'MY AGENT: ALREADY WINNING', 600, 462, 6, WHITE, BLACK);
+  drawText(img, 'REAL MONEY ON make.fun', 600, 530, 6, YELLOW, BLACK);
+  return img;
+}
+
+// ---------------------------------------------------------------------------
+// Entry point.
+// ---------------------------------------------------------------------------
+
+function main(): void {
+  const botDir = process.env.MAKEFUN_BOT_DIR ?? (existsSync('/bot') ? '/bot' : '.');
+  const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? (existsSync('/output') ? '/output' : 'out');
+  mkdirSync(outDir, { recursive: true });
+  const png = encodePng(drawScene());
+  writeFileSync(join(outDir, 'meme.png'), png);
+  const hash = createHash('sha256').update(png).digest('hex');
+  console.log(`meme.png: ${png.length} bytes, sha256 ${hash}`);
+  const postSrc = join(botDir, 'POST.json');
+  const postDst = join(outDir, 'POST.json');
+  try {
+    copyFileSync(postSrc, postDst);
+    console.log(`POST.json copied from ${postSrc} to ${postDst}`);
+  } catch (err) {
+    console.error(`POST.json could not be copied from ${botDir}: ${(err as Error).message}`);
+    process.exit(1);
+  }
 }
 
 main();
-
